@@ -37,3 +37,4 @@ libadwaita.workspace = true
 gtk4-layer-shell.workspace = true
 ksni.workspace = true
 x11rb.workspace = true
+gdk4-x11.workspace = true

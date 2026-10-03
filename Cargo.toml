@@ -32,6 +32,7 @@ wl-clipboard-rs = "0.9"
 
 # UI (versions verified against system GTK 4.22 / libadwaita 1.9 / gtk4-layer-shell 1.3)
 gtk4 = { version = "0.11", features = ["v4_10"] }
+gdk4-x11 = "0.11"
 libadwaita = { version = "0.9", features = ["v1_6", "gtk_v4_10"] }
 gtk4-layer-shell = "0.8"
 ksni = { version = "0.3", features = ["blocking"] }

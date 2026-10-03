@@ -4,6 +4,12 @@ A **Windows Win+V-style clipboard history manager for Linux**, written in Rust.
 Popup history at your cursor, pinning, search, paste-as-plain-text, images —
 plus a full settings panel. Works on **X11 and Wayland**.
 
+![ClipVault demo](docs/screenshots/demo.gif)
+
+| History popup | Settings panel |
+|---|---|
+| ![popup](docs/screenshots/popup.png) | ![settings](docs/screenshots/settings.png) |
+
 ![tech](https://img.shields.io/badge/GTK4-libadwaita-blue) ![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-green)
 
 ## Features

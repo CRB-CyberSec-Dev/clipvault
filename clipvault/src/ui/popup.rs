@@ -40,8 +40,30 @@ pub fn focused_window_x11() -> Option<u32> {
     clipvault_core::backend::x11::focused_window()
 }
 
+/// Borrow the singleton popup. GTK signal handlers can't unwind, so a
+/// RefCell panic here would abort the whole daemon — instead we
+/// try_borrow, log the caller, and skip. (A logged skip is a bug report;
+/// an abort is a dead daemon.)
+#[track_caller]
 fn with_popup<R>(f: impl FnOnce(&mut Popup) -> R) -> Option<R> {
-    POPUP.with(|p| p.borrow_mut().as_mut().map(|rc| f(&mut rc.borrow_mut())))
+    let caller = std::panic::Location::caller();
+    POPUP.with(|p| {
+        let Ok(outer) = p.try_borrow_mut() else {
+            tracing::error!("popup re-entry (outer) from {caller}");
+            return None;
+        };
+        // Clone the Rc out so no thread-local borrow stays alive.
+        let Some(rc) = outer.as_ref().cloned() else { return None };
+        drop(outer);
+        let result = match rc.try_borrow_mut() {
+            Ok(mut inner) => Some(f(&mut inner)),
+            Err(_) => {
+                tracing::error!("popup re-entry (inner) from {caller}");
+                None
+            }
+        };
+        result
+    })
 }
 
 pub fn is_visible() -> bool {
@@ -63,20 +85,21 @@ pub fn refresh_if_visible() {
 }
 
 pub fn show(storage: Rc<RefCell<Storage>>, config: Rc<RefCell<Config>>) {
-    let popup = POPUP.with(|p| {
+    POPUP.with(|p| {
         let mut slot = p.borrow_mut();
         if slot.is_none() {
             *slot = Some(Popup::build(storage.clone(), config.clone()));
         }
-        slot.clone().unwrap()
     });
-    {
-        let mut p = popup.borrow_mut();
+    with_popup(|p| {
+        // Clear search first — set_text fires search_changed, whose handler
+        // try_borrows and skips while we hold the borrow; our explicit
+        // rebuild below covers it.
+        p.search.set_text("");
         p.rebuild();
         p.position_and_present();
-        p.search.set_text("");
         p.search.grab_focus();
-    }
+    });
 }
 
 impl Popup {
@@ -157,7 +180,9 @@ impl Popup {
         {
             let p = popup.clone();
             search.connect_search_changed(move |_| {
-                p.borrow_mut().apply_filter();
+                if let Ok(mut p) = p.try_borrow_mut() {
+                    p.apply_filter();
+                }
             });
         }
         {
@@ -176,13 +201,36 @@ impl Popup {
         }
 
         let keyctl = gtk4::EventControllerKey::new();
+        // CAPTURE phase: the window sees keys before the focused search
+        // entry, so Enter/arrows/Escape can't be eaten by the entry.
+        keyctl.set_propagation_phase(gtk4::PropagationPhase::Capture);
         {
             let p = popup.clone();
             keyctl.connect_key_pressed(move |_, key, _code, mods| {
-                p.borrow_mut().on_key(key, mods)
+                match p.try_borrow_mut() {
+                    Ok(mut p) => p.on_key(key, mods),
+                    Err(_) => glib::Propagation::Proceed,
+                }
             });
         }
         window.add_controller(keyctl);
+
+        // Enter inside the search entry = activate the selected row.
+        {
+            let p = popup.clone();
+            search.connect_activate(move |_| {
+                let id = {
+                    let p = p.borrow();
+                    p.list
+                        .selected_row()
+                        .and_then(|r| p.ids.get(r.index() as usize).copied())
+                };
+                if let Some(id) = id {
+                    hide();
+                    crate::daemon::select_from_popup(id, false);
+                }
+            });
+        }
 
         // Hide on focus loss (window deactivated).
         {
@@ -209,6 +257,7 @@ impl Popup {
     /// Position per config/backend and show.
     fn position_and_present(&mut self) {
         if gtk4_layer_shell::is_supported() {
+            // Wayland path (layer-shell).
             let pos = self.config.borrow().popup_position;
             let on_x11 = std::env::var_os("WAYLAND_DISPLAY").is_none();
             match pos {
@@ -235,8 +284,41 @@ impl Popup {
                     self.window.set_margin(Edge::Bottom, 24);
                 }
             }
+            self.window.present();
+        } else {
+            // X11 path: gtk4-layer-shell has no X11 support in Debian's
+            // build, so present a plain window and position it ourselves
+            // via x11rb. xfwm4's initial smart-placement overwrites early
+            // moves, so retry at increasing delays until the window's
+            // root-relative origin matches (or attempts run out). Opacity
+            // hides the placement jump; the final attempt always restores
+            // it. (Driven from here, not connect_map — re-showing a
+            // hidden window does not reliably re-emit `map`.)
+            let pos = self.config.borrow().popup_position;
+            self.window.set_opacity(0.0);
+            self.window.present();
+            if let Some((tx, ty)) = compute_target(&self.window, pos) {
+                let delays = [80u64, 200, 400, 800];
+                for (i, d) in delays.iter().enumerate() {
+                    let w = self.window.clone();
+                    let last = i == delays.len() - 1;
+                    gtk4::glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(*d),
+                        move || {
+                            if !w.is_visible() {
+                                return; // user closed meanwhile
+                            }
+                            let done = x11_move_attempt(&w, tx, ty);
+                            if done || last {
+                                w.set_opacity(1.0);
+                            }
+                        },
+                    );
+                }
+            } else {
+                self.window.set_opacity(1.0);
+            }
         }
-        self.window.present();
     }
 
     fn rebuild(&mut self) {
@@ -399,16 +481,21 @@ impl Popup {
     fn on_key(&mut self, key: gdk::Key, mods: gdk::ModifierType) -> glib::Propagation {
         match key {
             gdk::Key::Escape => {
-                hide();
+                // Defer the hide until the RefCell borrow is released.
+                glib::idle_add_local_once(|| hide());
                 glib::Propagation::Stop
             }
             gdk::Key::Return | gdk::Key::KP_Enter => {
-                if let Some(row) = self.list.selected_row() {
-                    if let Some(id) = row_id(&row) {
-                        let plain = mods.contains(gdk::ModifierType::SHIFT_MASK);
+                let sel = self
+                    .list
+                    .selected_row()
+                    .and_then(|r| self.ids.get(r.index() as usize).copied());
+                if let Some(id) = sel {
+                    let plain = mods.contains(gdk::ModifierType::SHIFT_MASK);
+                    glib::idle_add_local_once(move || {
                         hide();
                         crate::daemon::select_from_popup(id, plain);
-                    }
+                    });
                 }
                 glib::Propagation::Stop
             }
@@ -421,32 +508,50 @@ impl Popup {
                 glib::Propagation::Stop
             }
             gdk::Key::Delete | gdk::Key::KP_Delete => {
-                if let Some(row) = self.list.selected_row() {
-                    if let Some(id) = row_id(&row) {
-                        crate::daemon::delete_item(id);
-                        self.rebuild();
-                    }
+                let sel = self
+                    .list
+                    .selected_row()
+                    .and_then(|r| self.ids.get(r.index() as usize).copied());
+                if let Some(id) = sel {
+                    crate::daemon::delete_item(id);
+                    self.rebuild();
                 }
                 glib::Propagation::Stop
             }
             gdk::Key::p if mods.contains(gdk::ModifierType::CONTROL_MASK) => {
-                if let Some(row) = self.list.selected_row() {
-                    if let Some(id) = row_id(&row) {
-                        let pinned = self
-                            .storage
-                            .borrow()
-                            .get(id)
-                            .ok()
-                            .flatten()
-                            .map(|i| i.pinned)
-                            .unwrap_or(false);
-                        crate::daemon::set_pinned(id, !pinned);
-                        self.rebuild();
-                    }
+                let sel = self
+                    .list
+                    .selected_row()
+                    .and_then(|r| self.ids.get(r.index() as usize).copied());
+                if let Some(id) = sel {
+                    let pinned = self
+                        .storage
+                        .borrow()
+                        .get(id)
+                        .ok()
+                        .flatten()
+                        .map(|i| i.pinned)
+                        .unwrap_or(false);
+                    crate::daemon::set_pinned(id, !pinned);
+                    self.rebuild();
                 }
                 glib::Propagation::Stop
             }
-            _ => glib::Propagation::Proceed,
+            _ => {
+                // Launcher UX: typing while a row (not the entry) has focus
+                // forwards the character into the search field.
+                if !self.search.has_focus() {
+                    if let Some(ch) = key.to_unicode().filter(|c| !c.is_control()) {
+                        let mut t = self.search.text().to_string();
+                        t.push(ch);
+                        self.search.set_text(&t);
+                        self.search.grab_focus();
+                        self.search.set_position(-1);
+                        return glib::Propagation::Stop;
+                    }
+                }
+                glib::Propagation::Proceed
+            }
         }
     }
 
@@ -499,4 +604,137 @@ fn glib_markup_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Compute the target root-coordinate position for the popup (cursor /
+/// center / bottom), clamped inside the pointer's monitor.
+fn compute_target(win: &gtk4::ApplicationWindow, pos: PopupPosition) -> Option<(i32, i32)> {
+    let (px, py) = clipvault_core::backend::x11::pointer_position()?;
+    let display = gtk4::prelude::WidgetExt::display(win);
+    let monitors = display.monitors();
+    let mut chosen = monitors.item(0).and_downcast::<gtk4::gdk::Monitor>();
+    for i in 0..monitors.n_items() {
+        if let Some(m) = monitors.item(i).and_downcast::<gtk4::gdk::Monitor>() {
+            let g = m.geometry();
+            let s = m.scale_factor();
+            let (mx, my, mw, mh) = (g.x() * s, g.y() * s, g.width() * s, g.height() * s);
+            if (px as i32) >= mx && (px as i32) < mx + mw && (py as i32) >= my && (py as i32) < my + mh
+            {
+                chosen = Some(m);
+                break;
+            }
+        }
+    }
+    let mon = chosen?;
+    let g = mon.geometry();
+    let s = mon.scale_factor();
+    let (mx, my, mw, mh) = (g.x() * s, g.y() * s, g.width() * s, g.height() * s);
+    let (ww, wh) = (
+        win.default_width().max(200) * s,
+        win.default_height().max(200) * s,
+    );
+
+    let (x, y) = match pos {
+        PopupPosition::Cursor => (px as i32 + 8, py as i32 + 8),
+        PopupPosition::Center => (mx + (mw - ww) / 2, my + (mh - wh) / 2),
+        PopupPosition::Bottom => (mx + (mw - ww) / 2, my + mh - wh - 24),
+    };
+    Some((
+        x.clamp(mx, mx + (mw - ww).max(0)),
+        y.clamp(my, my + (mh - wh).max(0)),
+    ))
+}
+
+/// One move attempt: set EWMH props (idempotent), configure position,
+/// then verify the root-relative origin via translate_coordinates
+/// (reparenting-safe). Returns true when the target is reached.
+fn x11_move_attempt(win: &gtk4::ApplicationWindow, tx: i32, ty: i32) -> bool {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{
+        AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt, EventMask, PropMode,
+        StackMode, CLIENT_MESSAGE_EVENT,
+    };
+    use x11rb::wrapper::ConnectionExt as _; // change_property32
+
+    let Some(surface) = win.surface() else { return false };
+    let Ok(x11s) = surface.downcast::<gdk4_x11::X11Surface>() else {
+        return true; // not X11 — nothing to do, stop retrying
+    };
+    let xid = x11s.xid() as u32;
+    let Ok((conn, screen_num)) = x11rb::connect(None) else {
+        return false;
+    };
+    let root = conn.setup().roots[screen_num].root;
+
+    let intern = |name: &str| -> Option<u32> {
+        conn.intern_atom(false, name.as_bytes())
+            .ok()?
+            .reply()
+            .ok()
+            .map(|r| r.atom)
+    };
+    if let (Some(net_state), Some(above), Some(skip_tb), Some(wm_type), Some(notif)) = (
+        intern("_NET_WM_STATE"),
+        intern("_NET_WM_STATE_ABOVE"),
+        intern("_NET_WM_STATE_SKIP_TASKBAR"),
+        intern("_NET_WM_WINDOW_TYPE"),
+        intern("_NET_WM_WINDOW_TYPE_NOTIFICATION"),
+    ) {
+        let _ = conn.change_property32(PropMode::REPLACE, xid, wm_type, AtomEnum::ATOM, &[notif]);
+        let msg = ClientMessageEvent {
+            response_type: CLIENT_MESSAGE_EVENT,
+            format: 32,
+            sequence: 0,
+            window: xid,
+            type_: net_state,
+            data: [1u32, above, skip_tb, 0, 0].into(), // 1 = _NET_WM_STATE_ADD
+        };
+        let _ = conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+            msg,
+        );
+    }
+
+    let _ = conn.configure_window(
+        xid,
+        &ConfigureWindowAux::new().x(tx).y(ty).stack_mode(StackMode::ABOVE),
+    );
+
+    // Raising our client window only reorders it inside the WM's frame —
+    // the frame keeps its stack slot and the popup stays occluded. Walk
+    // up to the frame (root's direct child) and raise THAT.
+    let mut topmost = xid;
+    let mut cur = xid;
+    for _ in 0..8 {
+        match conn.query_tree(cur).ok().and_then(|c| c.reply().ok()) {
+            Some(tree) if tree.parent != root && tree.parent != 0 => cur = tree.parent,
+            Some(_) => {
+                topmost = cur;
+                break;
+            }
+            None => break,
+        }
+    }
+    let _ = conn.configure_window(
+        topmost,
+        &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+    );
+    let _ = conn.flush();
+
+    // Verify: root-relative origin must match (WM may have adjusted).
+    let placed = conn
+        .translate_coordinates(xid, root, 0, 0)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| (r.dst_x as i32, r.dst_y as i32));
+    match placed {
+        Some((cx, cy)) => {
+            let done = (cx - tx).abs() <= 2 && (cy - ty).abs() <= 2;
+            tracing::debug!("x11-position: target ({tx},{ty}), now ({cx},{cy}), done={done}");
+            done
+        }
+        None => false,
+    }
 }
