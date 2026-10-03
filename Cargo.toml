@@ -3,7 +3,7 @@ resolver = "2"
 members = ["clipvault-core", "clipvault"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 authors = ["Chamal Bandara <https://github.com/CRB-CyberSec-Dev/>"]
