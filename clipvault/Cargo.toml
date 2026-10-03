@@ -1,0 +1,39 @@
+[package]
+name = "clipvault"
+description = "Win+V-style clipboard manager for Linux (GTK4/libadwaita)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.deb]
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/clipvault", "usr/bin/clipvault", "755"],
+    ["../packaging/clipvault.service", "usr/lib/systemd/user/clipvault.service", "644"],
+    ["../packaging/clipvault.desktop", "usr/share/applications/clipvault.desktop", "644"],
+    ["../packaging/clipvault.svg", "usr/share/icons/hicolor/scalable/apps/clipvault.svg", "644"],
+    ["../README.md", "usr/share/doc/clipvault/README.md", "644"],
+]
+maintainer = "Chamal Bandara"
+
+[[bin]]
+name = "clipvault"
+path = "src/main.rs"
+
+[dependencies]
+clipvault-core = { path = "../clipvault-core" }
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+directories.workspace = true
+async-channel.workspace = true
+gtk4.workspace = true
+libadwaita.workspace = true
+gtk4-layer-shell.workspace = true
+ksni.workspace = true
+x11rb.workspace = true

@@ -1,0 +1,14 @@
+[Unit]
+Description=ClipVault clipboard manager
+Documentation=https://github.com/local/clipvault
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/clipvault daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

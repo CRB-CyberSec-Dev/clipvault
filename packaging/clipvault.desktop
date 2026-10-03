@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=ClipVault
+GenericName=Clipboard Manager
+Comment=Clipboard history manager (Super+V)
+Exec=sh -c "clipvault toggle || (setsid -f clipvault daemon; sleep 1; clipvault toggle)"
+Icon=clipvault
+Categories=Utility;
+Keywords=clipboard;history;paste;clipvault;
+StartupNotify=false
+Actions=Settings;
+
+[Desktop Action Settings]
+Name=Settings
+Exec=clipvault settings
+Icon=clipvault
