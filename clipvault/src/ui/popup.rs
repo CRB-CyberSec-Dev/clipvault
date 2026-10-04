@@ -29,6 +29,10 @@ pub struct Popup {
     storage: Rc<RefCell<Storage>>,
     config: Rc<RefCell<Config>>,
     textures: HashMap<String, gdk::Texture>,
+    /// The one row currently showing its action buttons
+    /// (pin_btn, del_btn, was_pinned) — reset when hovering elsewhere or
+    /// when the pointer leaves the window, so icons never get stuck.
+    hover_slot: Rc<RefCell<Option<(gtk4::Button, gtk4::Button, bool)>>>,
 }
 
 thread_local! {
@@ -174,7 +178,21 @@ impl Popup {
             storage,
             config,
             textures: HashMap::new(),
+            hover_slot: Rc::new(RefCell::new(None)),
         }));
+
+        // Pointer leaving the window → reset any revealed row buttons.
+        {
+            let hs = popup.borrow().hover_slot.clone();
+            let win_motion = gtk4::EventControllerMotion::new();
+            win_motion.connect_leave(move |_| {
+                if let Some((pin, del, was_pinned)) = hs.borrow_mut().take() {
+                    pin.set_visible(was_pinned);
+                    del.set_visible(false);
+                }
+            });
+            window.add_controller(win_motion);
+        }
 
         // --- behavior wiring ---
         {
@@ -381,7 +399,7 @@ impl Popup {
                         tex.map(|t| gtk4::Picture::for_paintable(&t))
                             .unwrap_or_default()
                     };
-                    picture.set_size_request(-1, THUMB_SIZE);
+                    picture.set_size_request(320, THUMB_SIZE);
                     picture.set_content_fit(gtk4::ContentFit::Contain);
                     picture.set_halign(gtk4::Align::Start);
                     vbox.append(&picture);
@@ -397,34 +415,38 @@ impl Popup {
             }
             _ => {
                 let text = item.text_content.clone().unwrap_or_default();
-                let first_line = text.lines().next().unwrap_or("").to_string();
-                let title = if item.pinned {
-                    format!("📌 {first_line}")
+                // Title: first line only. Preview: the rest collapsed to a
+                // single line. Neither wraps — wrapping multi-line previews
+                // caused lines to overdraw each other (Pango lines+wrap
+                // overflow), so every row stays a predictable height.
+                let mut lines = text.lines();
+                let first_line = lines.next().unwrap_or("");
+                let rest = lines.collect::<Vec<_>>().join(" · ");
+                let rest = rest.trim().to_string();
+
+                let title_text = if conceal {
+                    "••••••••".to_string()
                 } else {
-                    first_line
+                    first_line.to_string()
                 };
-                let title = if conceal { "••••••••".to_string() } else { title };
-                let title_lbl = gtk4::Label::new(Some(&title));
-                title_lbl.set_xalign(0.0);
-                title_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                title_lbl.set_single_line_mode(true);
+                let title_lbl = gtk4::Label::new(None);
                 if item.kind == ClipKind::Html {
                     title_lbl.set_markup(&format!(
                         "{} <span size='small' alpha='60%'>[rich]</span>",
-                        glib_markup_escape(&title)
+                        glib_markup_escape(&title_text)
                     ));
+                } else {
+                    title_lbl.set_text(&title_text);
                 }
+                title_lbl.set_xalign(0.0);
+                title_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                title_lbl.set_single_line_mode(true);
                 vbox.append(&title_lbl);
 
-                let preview_text: String = if conceal {
-                    String::new()
-                } else {
-                    text.lines().skip(1).take(2).collect::<Vec<_>>().join("\n")
-                };
-                if !preview_text.is_empty() {
-                    let prev = gtk4::Label::new(Some(&preview_text));
+                if !conceal && !rest.is_empty() {
+                    let prev = gtk4::Label::new(Some(&rest));
                     prev.set_xalign(0.0);
-                    prev.set_lines(2);
+                    prev.set_single_line_mode(true);
                     prev.set_ellipsize(gtk4::pango::EllipsizeMode::End);
                     prev.add_css_class("dim-label");
                     vbox.append(&prev);
@@ -448,33 +470,73 @@ impl Popup {
 
         hbox.append(&vbox);
 
-        // Per-row actions: pin + delete.
+        // Actions: pin + delete, revealed on hover only. Pinned rows keep
+        // the (accent-colored) pin visible as the pinned indicator — no
+        // emoji in the text anymore.
         let pin_btn = gtk4::Button::from_icon_name("view-pin-symbolic");
         pin_btn.add_css_class("flat");
         pin_btn.set_tooltip_text(Some(if item.pinned { "Unpin" } else { "Pin" }));
-        if item.pinned {
-            pin_btn.add_css_class("accent");
-        }
         let del_btn = gtk4::Button::from_icon_name("user-trash-symbolic");
         del_btn.add_css_class("flat");
         del_btn.set_tooltip_text(Some("Remove"));
+
+        let pinned = item.pinned;
+        if pinned {
+            pin_btn.add_css_class("accent");
+        }
+        pin_btn.set_visible(pinned);
+        del_btn.set_visible(false);
+
         let id = item.id;
-        pin_btn.connect_clicked(move |btn| {
-            crate::daemon::set_pinned(id, !btn.has_css_class("accent"));
-            refresh_if_visible();
-        });
+        {
+            pin_btn.connect_clicked(move |_| {
+                let now = crate::daemon::is_pinned(id);
+                crate::daemon::set_pinned(id, !now);
+                refresh_if_visible();
+            });
+        }
         del_btn.connect_clicked(move |_| {
             crate::daemon::delete_item(id);
             refresh_if_visible();
         });
-        let btns = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        btns.set_valign(gtk4::Align::Center);
-        btns.append(&pin_btn);
-        btns.append(&del_btn);
-        hbox.append(&btns);
+
+        let actions = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        actions.set_valign(gtk4::Align::Center);
+        actions.append(&pin_btn);
+        actions.append(&del_btn);
+        hbox.append(&actions);
 
         let row = gtk4::ListBoxRow::new();
         row.set_child(Some(&hbox));
+
+        // Hover reveal: entering a row shows its buttons (and resets any
+        // previously revealed row); leaving resets. A window-level sweep
+        // covers fast pointer exits that skip the row's leave event.
+        let motion = gtk4::EventControllerMotion::new();
+        {
+            let slot = self.hover_slot.clone();
+            let (pin_b, del_b) = (pin_btn.clone(), del_btn.clone());
+            motion.connect_enter(move |_, _, _| {
+                if let Some((p, d, was_pinned)) = slot.borrow_mut().take() {
+                    p.set_visible(was_pinned);
+                    d.set_visible(false);
+                }
+                pin_b.set_visible(true);
+                del_b.set_visible(true);
+                *slot.borrow_mut() = Some((pin_b.clone(), del_b.clone(), pinned));
+            });
+        }
+        {
+            let slot = self.hover_slot.clone();
+            motion.connect_leave(move |_| {
+                if let Some((p, d, was_pinned)) = slot.borrow_mut().take() {
+                    p.set_visible(was_pinned);
+                    d.set_visible(false);
+                }
+            });
+        }
+        row.add_controller(motion);
+
         row
     }
 

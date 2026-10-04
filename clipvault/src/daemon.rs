@@ -195,6 +195,20 @@ pub fn set_pinned(id: i64, pinned: bool) {
     }
 }
 
+/// Current pinned state (for the pin toggle button).
+pub fn is_pinned(id: i64) -> bool {
+    current()
+        .and_then(|d| {
+            d.storage
+                .borrow()
+                .get(id)
+                .ok()
+                .flatten()
+                .map(|i| i.pinned)
+        })
+        .unwrap_or(false)
+}
+
 /// Called by the popup to delete an item.
 pub fn delete_item(id: i64) {
     if let Some(d) = current() {
