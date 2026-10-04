@@ -23,6 +23,7 @@ pub struct Popup {
     window: gtk4::ApplicationWindow,
     search: gtk4::SearchEntry,
     list: gtk4::ListBox,
+    scrolled: gtk4::ScrolledWindow,
     status: gtk4::Label,
     /// Row index → clip id, rebuilt together with the list.
     ids: Vec<i64>,
@@ -169,10 +170,26 @@ impl Popup {
 
         window.set_child(Some(&vbox));
 
+        // Row action buttons: space always reserved (no layout jitter on
+        // hover), icons fade in/out. Opacity alone would leave invisible
+        // buttons clickable — handlers also toggle can_target.
+        let css = gtk4::CssProvider::new();
+        css.load_from_data(
+            ".clipvault-popup button.row-action { opacity: 0; transition: opacity 120ms ease; }
+             .clipvault-popup button.row-action.revealed { opacity: 1; }
+             .clipvault-popup button.row-action.pinned { opacity: 1; }",
+        );
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::prelude::WidgetExt::display(&window),
+            &css,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+
         let popup = Rc::new(RefCell::new(Self {
             window: window.clone(),
             search: search.clone(),
             list: list.clone(),
+            scrolled: scrolled.clone(),
             status,
             ids: Vec::new(),
             storage,
@@ -181,14 +198,13 @@ impl Popup {
             hover_slot: Rc::new(RefCell::new(None)),
         }));
 
-        // Pointer leaving the window → reset any revealed row buttons.
+        // Pointer leaving the window → un-reveal any revealed row buttons.
         {
             let hs = popup.borrow().hover_slot.clone();
             let win_motion = gtk4::EventControllerMotion::new();
             win_motion.connect_leave(move |_| {
                 if let Some((pin, del, was_pinned)) = hs.borrow_mut().take() {
-                    pin.set_visible(was_pinned);
-                    del.set_visible(false);
+                    reveal(&pin, &del, was_pinned, false);
                 }
             });
             window.add_controller(win_motion);
@@ -364,6 +380,9 @@ impl Popup {
         if let Some(first) = self.list.row_at_index(0) {
             self.list.select_row(Some(&first));
         }
+        // New view starts at the top — the ScrolledWindow otherwise keeps
+        // its old offset across rebuilds.
+        self.scrolled.vadjustment().set_value(0.0);
         self.status.set_text(&format!("{} items", items.len()));
     }
 
@@ -388,21 +407,40 @@ impl Popup {
                     let path = Config::images_dir()
                         .map(|d| d.join(rel))
                         .unwrap_or_default();
-                    let picture = if let Some(tex) = self.textures.get(rel) {
-                        gtk4::Picture::for_paintable(tex)
+                    let tex = if let Some(t) = self.textures.get(rel) {
+                        Some(t.clone())
                     } else {
                         let file = gtk4::gio::File::for_path(&path);
-                        let tex = gdk::Texture::from_file(&file).ok();
-                        if let Some(t) = &tex {
+                        let t = gdk::Texture::from_file(&file).ok();
+                        if let Some(t) = &t {
                             self.textures.insert(rel.clone(), t.clone());
                         }
-                        tex.map(|t| gtk4::Picture::for_paintable(&t))
-                            .unwrap_or_default()
+                        t
                     };
-                    picture.set_size_request(320, THUMB_SIZE);
+                    let picture = tex
+                        .as_ref()
+                        .map(gtk4::Picture::for_paintable)
+                        .unwrap_or_default();
+                    // Left-aligned thumbnail sized to the image's aspect,
+                    // height-capped; wide images get width-capped instead of
+                    // stretching the popup or letterboxing (which looked
+                    // centered).
+                    let (tw, th) = tex
+                        .as_ref()
+                        .map(|t| (t.width().max(1), t.height().max(1)))
+                        .unwrap_or((16, 9));
+                    let disp_w =
+                        (THUMB_SIZE as f64 * tw as f64 / th as f64) as i32;
+                    picture.set_size_request(disp_w.clamp(48, 350), THUMB_SIZE);
                     picture.set_content_fit(gtk4::ContentFit::Contain);
                     picture.set_halign(gtk4::Align::Start);
-                    vbox.append(&picture);
+                    picture.set_valign(gtk4::Align::Start);
+                    // Pack inside a horizontal box: halign on the Picture
+                    // alone still centers it in the vertical box — a box
+                    // child is packed hard against the start edge.
+                    let img_wrap = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+                    img_wrap.append(&picture);
+                    vbox.append(&img_wrap);
                     let meta = gtk4::Label::new(Some(&format!(
                         "image · {} · {}",
                         human_bytes(item.byte_size),
@@ -470,22 +508,26 @@ impl Popup {
 
         hbox.append(&vbox);
 
-        // Actions: pin + delete, revealed on hover only. Pinned rows keep
-        // the (accent-colored) pin visible as the pinned indicator — no
-        // emoji in the text anymore.
+        // Actions: pin + delete. The column space is static — icons only
+        // fade in on hover (CSS opacity), so rows never reflow. Pinned
+        // rows keep the accent pin shown and clickable as the indicator.
         let pin_btn = gtk4::Button::from_icon_name("view-pin-symbolic");
         pin_btn.add_css_class("flat");
+        pin_btn.add_css_class("row-action");
         pin_btn.set_tooltip_text(Some(if item.pinned { "Unpin" } else { "Pin" }));
         let del_btn = gtk4::Button::from_icon_name("user-trash-symbolic");
         del_btn.add_css_class("flat");
+        del_btn.add_css_class("row-action");
         del_btn.set_tooltip_text(Some("Remove"));
 
         let pinned = item.pinned;
         if pinned {
             pin_btn.add_css_class("accent");
+            pin_btn.add_css_class("pinned"); // CSS keeps it opaque
         }
-        pin_btn.set_visible(pinned);
-        del_btn.set_visible(false);
+        // Transparent icons must not catch clicks.
+        pin_btn.set_can_target(pinned);
+        del_btn.set_can_target(false);
 
         let id = item.id;
         {
@@ -509,20 +551,18 @@ impl Popup {
         let row = gtk4::ListBoxRow::new();
         row.set_child(Some(&hbox));
 
-        // Hover reveal: entering a row shows its buttons (and resets any
-        // previously revealed row); leaving resets. A window-level sweep
-        // covers fast pointer exits that skip the row's leave event.
+        // Hover reveal: swap the CSS class + input targeting. The tracked
+        // slot resets any previously revealed row; a window-level sweep
+        // covers fast exits that skip the row's leave event.
         let motion = gtk4::EventControllerMotion::new();
         {
             let slot = self.hover_slot.clone();
             let (pin_b, del_b) = (pin_btn.clone(), del_btn.clone());
             motion.connect_enter(move |_, _, _| {
                 if let Some((p, d, was_pinned)) = slot.borrow_mut().take() {
-                    p.set_visible(was_pinned);
-                    d.set_visible(false);
+                    reveal(&p, &d, was_pinned, false);
                 }
-                pin_b.set_visible(true);
-                del_b.set_visible(true);
+                reveal(&pin_b, &del_b, pinned, true);
                 *slot.borrow_mut() = Some((pin_b.clone(), del_b.clone(), pinned));
             });
         }
@@ -530,8 +570,7 @@ impl Popup {
             let slot = self.hover_slot.clone();
             motion.connect_leave(move |_| {
                 if let Some((p, d, was_pinned)) = slot.borrow_mut().take() {
-                    p.set_visible(was_pinned);
-                    d.set_visible(false);
+                    reveal(&p, &d, was_pinned, false);
                 }
             });
         }
@@ -631,6 +670,22 @@ impl Popup {
 /// ever appended in order during rebuild).
 fn row_id(row: &gtk4::ListBoxRow) -> Option<i64> {
     with_popup(|p| p.ids.get(row.index() as usize).copied()).flatten()
+}
+
+/// Fade row action buttons in/out. `pinned` keeps the pin icon visible
+/// (and clickable) even when not revealed; delete is hover-only.
+fn reveal(pin: &gtk4::Button, del: &gtk4::Button, pinned: bool, on: bool) {
+    if on {
+        pin.add_css_class("revealed");
+        del.add_css_class("revealed");
+        pin.set_can_target(true);
+        del.set_can_target(true);
+    } else {
+        pin.remove_css_class("revealed");
+        del.remove_css_class("revealed");
+        pin.set_can_target(pinned);
+        del.set_can_target(false);
+    }
 }
 
 fn human_bytes(n: u64) -> String {
